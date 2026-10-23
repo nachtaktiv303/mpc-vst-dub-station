@@ -297,6 +297,7 @@ struct DubStation
 
     float    duck_env_;
     int      flush_pending_, flush_cooldown_; // PANIC: deferred to the audio thread + debounced (see ApplyFx)
+    int      panic_flash_frames_, panic_changed_; // PANIC: engine-driven ~300 ms "armed" flash on the toggle (see mpc_engine_changed)
     float    fb_lp_l_, fb_lp_r_;   // one-pole LP in the feedback path (tape-style band-limit, tames aliasing)
     float    fb_lp2_l_, fb_lp2_r_; // Delay B feedback band-limit LP
     uint32_t rng_;
@@ -486,6 +487,8 @@ struct DubStation
         duck_env_  = 0.f;
         flush_pending_ = 0;
         flush_cooldown_ = 0;
+        panic_flash_frames_ = 0;
+        panic_changed_ = 0;
         fb_lp_l_ = fb_lp_r_ = 0.f;
         fb_lp2_l_ = fb_lp2_r_ = 0.f;
         rng_       = 2463534242u;
@@ -550,6 +553,14 @@ struct DubStation
             Flush();
             flush_pending_  = 0;
             flush_cooldown_ = (int)(0.5f * kSampleRate);
+        }
+        // PANIC flash: count the ~400 ms down and, when it ends, drop the toggle back off and flag it so
+        // mpc_engine_changed reports the off to the host (the screen toggle follows).
+        if(panic_flash_frames_ > 0 && (panic_flash_frames_ -= (int)size) <= 0)
+        {
+            panic_flash_frames_ = 0;
+            p[P_PANIC]          = 0.f;
+            panic_changed_      = 1;
         }
 
         float dryl[128], dryr[128], coll[128], colr[128];
@@ -822,7 +833,15 @@ void dc_set_param(void *inst, const char *key, const char *val)
         return;
     SetValue(t, i, (float)atof(val));
     if(i == P_PANIC)   // any tap of the Panic toggle requests a flush; the audio thread does it (debounced)
-        t->flush_pending_ = 1;
+    {
+        // Force the toggle "on" and drive a fixed ~400 ms flash from the engine (mpc_engine_changed reports it
+        // back off), so a tap always blinks for the same time regardless of hold or a double-tap, instead of
+        // latching or racing MPC's own toggle gesture.
+        t->p[P_PANIC]        = 1.f;
+        t->panic_flash_frames_ = (int)(0.3f * kSampleRate);
+        t->panic_changed_    = 1;   // tell the host it's on now
+        t->flush_pending_    = 1;
+    }
     t->Apply();
 }
 
@@ -934,4 +953,19 @@ const mpc_engine_t kEngine = {dc_create, dc_destroy, dc_midi, dc_set_param, dc_g
 extern "C" const mpc_engine_t *mpc_engine(void)
 {
     return &kEngine;
+}
+
+// The wrapper polls this for parameters the engine moved by itself. We use it only for the PANIC flash:
+// the tap sets the toggle on and arms a timer; when it ends ApplyFx drops it back off and flags it here, so
+// the host turns the on-screen toggle back off on its own (one flagged key per call, 0 when nothing changed).
+extern "C" int mpc_engine_changed(void *inst, char *key, int len)
+{
+    DubStation *t = (DubStation *)inst;
+    if(t->panic_changed_)
+    {
+        t->panic_changed_ = 0;
+        snprintf(key, (size_t)len, "panic");
+        return 1;
+    }
+    return 0;
 }
